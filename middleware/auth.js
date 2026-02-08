@@ -1,9 +1,60 @@
 import jwt from "jsonwebtoken";
 import { Organization } from "../models/organization.model.js";
+import { User } from "../models/user.model.js";
+import {
+  issueTokens,
+  setAuthCookies,
+  clearAuthCookies,
+} from "../lib/auth.js";
 
-function clearAuthCookies(res) {
-  res.clearCookie("accessToken", { path: "/" });
-  res.clearCookie("refreshToken", { path: "/" });
+/**
+ * Resolve entity + type from decoded JWT.
+ * Handles old tokens (no userType) by checking both collections.
+ */
+export async function resolveEntity(decoded) {
+  if (decoded?.userType === "user") {
+    const user = await User.findById(decoded.id);
+    return user ? { entity: user, type: "user" } : null;
+  }
+  if (decoded?.userType === "organization") {
+    const org = await Organization.findById(decoded.id);
+    return org ? { entity: org, type: "organization" } : null;
+  }
+  // Old token without userType — try Organization first, then User
+  const org = await Organization.findById(decoded.id);
+  if (org) return { entity: org, type: "organization" };
+  const user = await User.findById(decoded.id);
+  if (user) return { entity: user, type: "user" };
+  return null;
+}
+
+/** Build a consistent user payload from entity + type */
+export function buildUserPayload(entity, type) {
+  if (type === "user") {
+    return {
+      id: entity._id,
+      email: entity.email,
+      name: entity.name,
+      role: entity.role || "MEMBER",
+      organizationId: entity.organizationId,
+      userType: "user",
+    };
+  }
+  // Organization → owner
+  return {
+    id: entity._id,
+    email: entity.email,
+    name: entity.ownerName || entity.name,
+    role: "OWNER",
+    organizationId: entity._id,
+    userType: "organization",
+  };
+}
+
+/** Build a safe user response (no sensitive fields) */
+export function buildUserResponse(entity, type) {
+  const p = buildUserPayload(entity, type);
+  return { id: p.id, name: p.name, email: p.email, role: p.role, organizationId: p.organizationId };
 }
 
 export async function authenticate(req, res, next) {
@@ -14,17 +65,16 @@ export async function authenticate(req, res, next) {
     try {
       const decoded = jwt.decode(accessToken);
       if (decoded?.id) {
-        const org = await Organization.findById(decoded.id);
-        if (org?.publicKey) {
-          const payload = jwt.verify(accessToken, org.publicKey, { algorithms: ["RS256"] });
+        const result = await resolveEntity(decoded);
+        if (result?.entity?.publicKey) {
+          jwt.verify(accessToken, result.entity.publicKey, { algorithms: ["RS256"] });
 
-          // Session invalidated by another device?
-          if (refreshToken && org.refreshToken !== refreshToken) {
+          if (refreshToken && result.entity.refreshToken !== refreshToken) {
             clearAuthCookies(res);
             return res.status(401).json({ message: "Session invalidated" });
           }
 
-          req.user = payload;
+          req.user = buildUserPayload(result.entity, result.type);
           return next();
         }
       }
@@ -46,47 +96,31 @@ export async function authenticate(req, res, next) {
       return res.status(401).json({ message: "Invalid refresh token" });
     }
 
-    const org = await Organization.findById(decoded.id);
-    if (!org?.publicKey || !org?.privateKey) {
+    const result = await resolveEntity(decoded);
+    if (!result?.entity?.publicKey || !result?.entity?.privateKey) {
       clearAuthCookies(res);
       return res.status(401).json({ message: "User not found" });
     }
 
-    jwt.verify(refreshToken, org.publicKey, { algorithms: ["RS256"] });
+    const { entity, type } = result;
 
-    if (org.refreshToken !== refreshToken || !org.refreshTokenExpires || org.refreshTokenExpires < new Date()) {
+    jwt.verify(refreshToken, entity.publicKey, { algorithms: ["RS256"] });
+
+    if (entity.refreshToken !== refreshToken || !entity.refreshTokenExpires || entity.refreshTokenExpires < new Date()) {
       clearAuthCookies(res);
       return res.status(401).json({ message: "Refresh token expired" });
     }
 
-    // Issue new tokens
-    const rememberMe = !!org.rememberMe;
-    const payload = { id: org._id, email: org.email, name: org.name };
+    // Issue new tokens using shared helper
+    const rememberMe = !!entity.rememberMe;
+    const payload = buildUserPayload(entity, type);
+    const tokens = issueTokens(entity.privateKey, payload, rememberMe);
 
-    const newAccessToken = jwt.sign(payload, org.privateKey, { algorithm: "RS256", expiresIn: "15m" });
-    const refreshExpires = rememberMe
-      ? new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
-      : new Date(Date.now() + 2 * 60 * 60 * 1000);
-    const newRefreshToken = jwt.sign(payload, org.privateKey, {
-      algorithm: "RS256",
-      expiresIn: Math.floor((refreshExpires.getTime() - Date.now()) / 1000),
-    });
+    entity.refreshToken = tokens.refreshToken;
+    entity.refreshTokenExpires = tokens.refreshExpires;
+    await entity.save();
 
-    org.refreshToken = newRefreshToken;
-    org.refreshTokenExpires = refreshExpires;
-    await org.save();
-
-    const cookieOpts = {
-      httpOnly: true,
-      secure: process.env.NODE_ENV !== "development",
-      sameSite: "lax",
-      path: "/",
-    };
-    res.cookie("accessToken", newAccessToken, { ...cookieOpts, maxAge: 15 * 60 * 1000 });
-    res.cookie("refreshToken", newRefreshToken, {
-      ...cookieOpts,
-      maxAge: rememberMe ? 7 * 24 * 60 * 60 * 1000 : 2 * 60 * 60 * 1000,
-    });
+    setAuthCookies(res, tokens.accessToken, tokens.refreshToken, rememberMe);
 
     req.user = payload;
     return next();

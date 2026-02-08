@@ -1,14 +1,26 @@
 import mongoose from "mongoose";
 
-
-const organizationSchema = new mongoose.Schema(
+const userSchema = new mongoose.Schema(
   {
+    organizationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Organization",
+      required: true,
+    },
     name: { type: String, required: true, trim: true },
-    ownerName: { type: String, required: true, trim: true },
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+    },
     password: { type: String, required: true },
-    address: { type: String, trim: true },
-    phone: { type: String, required: true, trim: true },
+    role: {
+      type: String,
+      enum: ["OWNER", "MEMBER"],
+      default: "MEMBER",
+    },
     refreshToken: { type: String, default: null },
     refreshTokenExpires: { type: Date, default: null },
     rememberMe: { type: Boolean, default: false },
@@ -20,4 +32,4 @@ const organizationSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-export const Organization = mongoose.model("Organization", organizationSchema);
+export const User = mongoose.model("User", userSchema);
