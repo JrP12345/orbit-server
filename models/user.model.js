@@ -2,25 +2,12 @@ import mongoose from "mongoose";
 
 const userSchema = new mongoose.Schema(
   {
-    organizationId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Organization",
-      required: true,
-    },
+    organizationId: { type: mongoose.Schema.Types.ObjectId, ref: "Organization", required: true, index: true },
     name: { type: String, required: true, trim: true },
-    email: {
-      type: String,
-      required: true,
-      unique: true,
-      lowercase: true,
-      trim: true,
-    },
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     password: { type: String, required: true },
-    role: {
-      type: String,
-      enum: ["OWNER", "MEMBER"],
-      default: "MEMBER",
-    },
+    role: { type: String, enum: ["OWNER", "MEMBER"], default: "MEMBER" },
+    roleId: { type: mongoose.Schema.Types.ObjectId, ref: "Role", default: null },
     refreshToken: { type: String, default: null },
     refreshTokenExpires: { type: Date, default: null },
     rememberMe: { type: Boolean, default: false },

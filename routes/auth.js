@@ -3,55 +3,68 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { Organization } from "../models/organization.model.js";
 import { User } from "../models/user.model.js";
+import { Client } from "../models/client.model.js";
 import { generateToken, hashToken } from "../lib/crypto.js";
 import { sendResetPasswordEmail } from "../lib/email.js";
-import {
-  generateKeys,
-  issueTokens,
-  setAuthCookies,
-  clearAuthCookies,
-} from "../lib/auth.js";
-import {
-  resolveEntity,
-  buildUserPayload,
-  buildUserResponse,
-} from "../middleware/auth.js";
+import { generateKeys, issueTokens, setAuthCookies, clearAuthCookies } from "../lib/auth.js";
+import { resolveEntity, buildUserPayload, buildUserResponse, resolvePermissions } from "../middleware/auth.js";
+import { getDefaultPlan } from "../lib/plans.js";
+import { bootstrapOrgRoles } from "../lib/roles.js";
+import { BCRYPT_ROUNDS, normalizeEmail } from "../lib/validate.js";
+import { loginEntity, checkEmailAvailable } from "../lib/helpers.js";
 
 const router = express.Router();
 
-/* ─── Routes ─── */
-
-// Registration (dev only)
 router.post("/register", async (req, res) => {
   if (process.env.NODE_ENV !== "development") {
     return res.status(403).json({ message: "Registration is only allowed in development environment" });
   }
   try {
     const { name, ownerName, email, password, address, phone } = req.body;
-    if (!name || !ownerName || !email || !password || !phone) {
-      return res.status(400).json({ message: "All fields are required" });
+    if (!name?.trim() || !ownerName?.trim() || !email?.trim() || !password) {
+      return res.status(400).json({ message: "Organization name, owner name, email, and password are required" });
     }
-    if (await Organization.findOne({ email })) {
-      return res.status(409).json({ message: "User already exists" });
+    if (password.length < 8) {
+      return res.status(400).json({ message: "Password must be at least 8 characters" });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const validEmail = normalizeEmail(email);
+    if (!validEmail) return res.status(400).json({ message: "Invalid email address" });
+
+    const emailErr = await checkEmailAvailable(validEmail);
+    if (emailErr) return res.status(409).json({ message: emailErr });
+
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const { privateKey, publicKey } = generateKeys();
-    
+    const defaultPlan = await getDefaultPlan();
+
     const organization = await Organization.create({
-      name,
-      ownerName,
-      email,
+      name: name.trim(),
+      ownerName: ownerName.trim(),
+      email: validEmail,
       password: hashedPassword,
-      address,
-      phone,
+      address: address?.trim() || "",
+      phone: phone?.trim() || "",
       privateKey,
       publicKey,
+      ...(defaultPlan && { planId: defaultPlan._id }),
     });
 
+    await bootstrapOrgRoles(organization._id);
+
+    const payload = buildUserPayload(organization, "organization");
+    const tokens = issueTokens(organization.privateKey, payload, false);
+    organization.refreshToken = tokens.refreshToken;
+    organization.refreshTokenExpires = tokens.refreshExpires;
+    await organization.save();
+
+    setAuthCookies(res, tokens.accessToken, tokens.refreshToken, false);
+    const perms = await resolvePermissions(organization, "organization");
+
     return res.status(201).json({
-      message: "User registered successfully",
-      user: { id: organization._id, name: organization.name, email: organization.email },
+      success: true,
+      message: "Registration successful",
+      user: buildUserResponse(organization, "organization", perms.permissions, perms.roleName),
     });
   } catch (error) {
     console.error("Registration error:", error);
@@ -59,66 +72,30 @@ router.post("/register", async (req, res) => {
   }
 });
 
-// Login (supports Organization owner + invited User)
 router.post("/login", async (req, res) => {
   try {
     const { email, password, rememberMe } = req.body;
-    if (!email || !password)
+    if (!email?.trim() || !password)
       return res.status(400).json({ message: "Email and password are required" });
 
-    // 1) Try Organization (owner) login
-    const org = await Organization.findOne({ email });
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail) return res.status(400).json({ message: "Invalid email address" });
+
+    const org = await Organization.findOne({ email: normalizedEmail });
     if (org && (await bcrypt.compare(password, org.password))) {
-      if (!org.privateKey || !org.publicKey) {
-        const { privateKey, publicKey } = generateKeys();
-        org.privateKey = privateKey;
-        org.publicKey = publicKey;
-      }
-
-      const payload = buildUserPayload(org, "organization");
-
-      const tokens = issueTokens(org.privateKey, payload, rememberMe);
-      org.refreshToken = tokens.refreshToken;
-      org.refreshTokenExpires = tokens.refreshExpires;
-      org.rememberMe = !!rememberMe;
-      await org.save();
-
-      setAuthCookies(res, tokens.accessToken, tokens.refreshToken, rememberMe);
-
-      return res.json({
-        success: true,
-        message: "Login successful",
-        user: buildUserResponse(org, "organization"),
-      });
+      return res.json(await loginEntity(res, org, "organization", rememberMe, generateKeys));
     }
 
-    // 2) Try User (invited member) login
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email: normalizedEmail });
     if (user && (await bcrypt.compare(password, user.password))) {
-      if (!user.privateKey || !user.publicKey) {
-        const { privateKey, publicKey } = generateKeys();
-        user.privateKey = privateKey;
-        user.publicKey = publicKey;
-      }
-
-      const payload = buildUserPayload(user, "user");
-
-      const tokens = issueTokens(user.privateKey, payload, rememberMe);
-      user.refreshToken = tokens.refreshToken;
-      user.refreshTokenExpires = tokens.refreshExpires;
-      user.rememberMe = !!rememberMe;
-      await user.save();
-
-      setAuthCookies(res, tokens.accessToken, tokens.refreshToken, rememberMe);
-
-      return res.json({
-        success: true,
-        message: "Login successful",
-        user: buildUserResponse(user, "user"),
-      });
+      return res.json(await loginEntity(res, user, "user", rememberMe, generateKeys));
     }
 
-    // Neither found
+    const client = await Client.findOne({ email: normalizedEmail, status: "ACTIVE" });
+    if (client && client.password && (await bcrypt.compare(password, client.password))) {
+      return res.json(await loginEntity(res, client, "client", rememberMe, generateKeys));
+    }
+
     return res.status(401).json({ message: "Invalid email or password" });
   } catch (error) {
     console.error("Login error:", error);
@@ -126,55 +103,37 @@ router.post("/login", async (req, res) => {
   }
 });
 
-// Forgot password — sends reset link via email
 router.post("/forgot-password", async (req, res) => {
   try {
     const { email } = req.body;
-    if (!email)
-      return res.status(400).json({ message: "Email is required" });
+    if (!email?.trim()) return res.status(400).json({ message: "Email is required" });
 
-    // Find account in either collection
-    let entity = await Organization.findOne({ email: email.toLowerCase() });
+    const safeEmail = normalizeEmail(email);
+    if (!safeEmail) return res.status(400).json({ message: "Invalid email address" });
+
+    let entity = await Organization.findOne({ email: safeEmail });
     let entityType = "organization";
+    if (!entity) { entity = await User.findOne({ email: safeEmail }); entityType = "user"; }
+    if (!entity) { entity = await Client.findOne({ email: safeEmail, status: { $in: ["ACTIVE", "INVITED"] } }); entityType = "client"; }
+
     if (!entity) {
-      entity = await User.findOne({ email: email.toLowerCase() });
-      entityType = "user";
+      return res.json({ success: true, message: "If an account exists with that email, we've sent password reset instructions" });
     }
 
-    // Always respond success (don't reveal whether email exists)
-    if (!entity) {
-      return res.json({
-        success: true,
-        message: "If an account exists with that email, we've sent password reset instructions",
-      });
-    }
-
-    // Generate reset token (expires in 1 hour)
     const rawToken = generateToken();
-    const hashed = hashToken(rawToken);
-
-    entity.resetToken = hashed;
-    entity.resetTokenExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    entity.resetToken = hashToken(rawToken);
+    entity.resetTokenExpires = new Date(Date.now() + 60 * 60 * 1000);
     await entity.save();
 
     const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
     const resetLink = `${frontendUrl}/reset-password?token=${rawToken}&type=${entityType}`;
-
-    const emailResult = await sendResetPasswordEmail({
-      to: entity.email,
-      resetLink,
-    });
-
-    // In dev or if email fails, return the link for manual use
-    const devOrFailed = process.env.NODE_ENV === "development" || !emailResult.success;
+    const emailResult = await sendResetPasswordEmail({ to: entity.email, resetLink });
 
     return res.json({
       success: true,
-      message: emailResult.success
-        ? "If an account exists with that email, we've sent password reset instructions"
-        : "Reset link generated but email delivery failed",
+      message: "If an account exists with that email, we've sent password reset instructions",
       emailSent: emailResult.success,
-      ...(devOrFailed && { resetLink }),
+      ...(process.env.NODE_ENV === "development" && { resetLink }),
     });
   } catch (error) {
     console.error("Forgot password error:", error);
@@ -182,76 +141,43 @@ router.post("/forgot-password", async (req, res) => {
   }
 });
 
-// Reset password — validates token and sets new password
 router.post("/reset-password", async (req, res) => {
   try {
     const { token, password, type } = req.body;
-
-    if (!token || !password) {
-      return res.status(400).json({ message: "Token and new password are required" });
-    }
-    if (password.length < 8) {
-      return res.status(400).json({ message: "Password must be at least 8 characters" });
-    }
+    if (!token || !password) return res.status(400).json({ message: "Token and new password are required" });
+    if (password.length < 8) return res.status(400).json({ message: "Password must be at least 8 characters" });
 
     const hashed = hashToken(token);
+    const query = { resetToken: hashed, resetTokenExpires: { $gt: new Date() } };
 
-    // Find entity with valid reset token
-    let entity = null;
-    let entityType = type;
+    const models = { organization: Organization, user: User, client: Client };
+    let entity = null, entityType = type;
 
-    if (type === "user") {
-      entity = await User.findOne({
-        resetToken: hashed,
-        resetTokenExpires: { $gt: new Date() },
-      });
-      entityType = "user";
-    } else if (type === "organization") {
-      entity = await Organization.findOne({
-        resetToken: hashed,
-        resetTokenExpires: { $gt: new Date() },
-      });
-      entityType = "organization";
+    if (type && models[type]) {
+      entity = await models[type].findOne(query);
     } else {
-      // No type provided — try both
-      entity = await Organization.findOne({
-        resetToken: hashed,
-        resetTokenExpires: { $gt: new Date() },
-      });
-      entityType = "organization";
-      if (!entity) {
-        entity = await User.findOne({
-          resetToken: hashed,
-          resetTokenExpires: { $gt: new Date() },
-        });
-        entityType = "user";
+      for (const [t, Model] of Object.entries(models)) {
+        entity = await Model.findOne(query);
+        if (entity) { entityType = t; break; }
       }
     }
 
-    if (!entity) {
-      return res.status(400).json({ message: "Invalid or expired reset link" });
-    }
+    if (!entity) return res.status(400).json({ message: "Invalid or expired reset link" });
 
-    // Update password and clear reset token
-    entity.password = await bcrypt.hash(password, 10);
+    entity.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
     entity.resetToken = null;
     entity.resetTokenExpires = null;
-    // Invalidate all sessions
     entity.refreshToken = null;
     entity.refreshTokenExpires = null;
     await entity.save();
 
-    return res.json({
-      success: true,
-      message: "Password reset successfully. You can now log in with your new password.",
-    });
+    return res.json({ success: true, message: "Password reset successfully. You can now log in with your new password." });
   } catch (error) {
     console.error("Reset password error:", error);
     return res.status(500).json({ message: "Internal server error" });
   }
 });
 
-// Verify authentication (for frontend page refresh)
 router.post("/verify", async (req, res) => {
   const { accessToken, refreshToken } = req.cookies || {};
 
@@ -273,13 +199,12 @@ router.post("/verify", async (req, res) => {
               clearAuthCookies(res);
               return res.json({ authenticated: false });
             }
+            const perms = await resolvePermissions(result.entity, result.type);
             return res.json({
               authenticated: true,
-              user: buildUserResponse(result.entity, result.type),
+              user: buildUserResponse(result.entity, result.type, perms.permissions, perms.roleName),
             });
-          } catch {
-            // Access token expired, fall through to refresh
-          }
+          } catch { /* expired, fall through */ }
         }
       }
     }
@@ -325,9 +250,10 @@ router.post("/verify", async (req, res) => {
     await entity.save();
 
     setAuthCookies(res, tokens.accessToken, tokens.refreshToken, rememberMe);
+    const verifyPerms = await resolvePermissions(entity, type);
     return res.json({
       authenticated: true,
-      user: buildUserResponse(entity, type),
+      user: buildUserResponse(entity, type, verifyPerms.permissions, verifyPerms.roleName),
     });
   } catch {
     clearAuthCookies(res);
@@ -335,25 +261,23 @@ router.post("/verify", async (req, res) => {
   }
 });
 
-// Logout (supports both Organization and User)
 router.post("/logout", async (req, res) => {
-  const { refreshToken } = req.cookies || {};
-  if (refreshToken) {
-    // Try Organization first
-    const org = await Organization.findOneAndUpdate(
-      { refreshToken },
-      { refreshToken: null, refreshTokenExpires: null, rememberMe: false }
-    );
-    // If not found, try User
-    if (!org) {
-      await User.findOneAndUpdate(
-        { refreshToken },
-        { refreshToken: null, refreshTokenExpires: null, rememberMe: false }
-      );
+  try {
+    const { refreshToken } = req.cookies || {};
+    if (refreshToken) {
+      const clearFields = { refreshToken: null, refreshTokenExpires: null, rememberMe: false };
+      const org = await Organization.findOneAndUpdate({ refreshToken }, clearFields);
+      if (!org) {
+        const user = await User.findOneAndUpdate({ refreshToken }, clearFields);
+        if (!user) await Client.findOneAndUpdate({ refreshToken }, clearFields);
+      }
     }
+    clearAuthCookies(res);
+    return res.json({ success: true });
+  } catch {
+    clearAuthCookies(res);
+    return res.json({ success: true });
   }
-  clearAuthCookies(res);
-  return res.json({ success: true });
 });
 
 export default router;

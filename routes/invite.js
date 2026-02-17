@@ -3,89 +3,82 @@ import bcrypt from "bcryptjs";
 import { Organization } from "../models/organization.model.js";
 import { User } from "../models/user.model.js";
 import { Invite } from "../models/invite.model.js";
+import { Client } from "../models/client.model.js";
+import { Role } from "../models/role.model.js";
 import { authenticate } from "../middleware/auth.js";
-import { requireRole } from "../middleware/role.js";
+import { requirePermission } from "../middleware/permission.js";
 import { generateToken, hashToken } from "../lib/crypto.js";
-import {
-  generateKeys,
-  issueTokens,
-  setAuthCookies,
-} from "../lib/auth.js";
+import { generateKeys, issueTokens, setAuthCookies } from "../lib/auth.js";
+import { buildUserPayload, buildUserResponse, resolvePermissions } from "../middleware/auth.js";
 import { sendInviteEmail } from "../lib/email.js";
+import { getDefaultMemberRole } from "../lib/roles.js";
+import { BCRYPT_ROUNDS, normalizeEmail } from "../lib/validate.js";
+import { checkEmailAvailable } from "../lib/helpers.js";
 
 const router = express.Router();
 
-/* ─── POST /api/invites — Create invite (OWNER only, MEMBER role only) ─── */
-
-router.post("/", authenticate, requireRole("OWNER"), async (req, res) => {
+router.post("/", authenticate, requirePermission("USER_INVITE"), async (req, res) => {
   try {
-    const { email } = req.body;
-    const role = "MEMBER"; // Only MEMBER allowed — one owner per org
+    const { email, roleId } = req.body;
+    if (!email) return res.status(400).json({ message: "Email is required" });
 
-    if (!email) {
-      return res.status(400).json({ message: "Email is required" });
-    }
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail) return res.status(400).json({ message: "Invalid email address" });
 
     const organizationId = req.user.organizationId;
 
-    // Check if email is the org owner
     const org = await Organization.findById(organizationId);
-    if (!org) {
-      return res.status(404).json({ message: "Organization not found" });
-    }
-    if (org.email === email.toLowerCase()) {
-      return res
-        .status(409)
-        .json({ message: "This email is already the organization owner" });
+    if (!org) return res.status(404).json({ message: "Organization not found" });
+    if (org.email === normalizedEmail) {
+      return res.status(409).json({ message: "This email is already the organization owner" });
     }
 
-    // Check if email is already a user in the org
-    const existingUser = await User.findOne({
-      email: email.toLowerCase(),
-      organizationId,
-    });
+    const existingUser = await User.findOne({ email: normalizedEmail, organizationId });
     if (existingUser) {
-      return res
-        .status(409)
-        .json({ message: "This email is already a member of your organization" });
+      return res.status(409).json({ message: "This email is already a member of your organization" });
     }
 
-    // Check for existing pending invite
-    const existingInvite = await Invite.findOne({
-      email: email.toLowerCase(),
-      organizationId,
-      status: "PENDING",
-    });
+    const existingClient = await Client.findOne({ email: normalizedEmail });
+    if (existingClient) {
+      return res.status(409).json({ message: "This email is already registered as a client" });
+    }
+
+    const existingInvite = await Invite.findOne({ email: normalizedEmail, organizationId, status: "PENDING" });
     if (existingInvite) {
-      return res
-        .status(409)
-        .json({ message: "An invite has already been sent to this email" });
+      return res.status(409).json({ message: "An invite has already been sent to this email" });
     }
 
-    // Generate token
     const rawToken = generateToken();
     const hashedToken = hashToken(rawToken);
 
-    // Create invite (expiresAt = now + 48 hours)
+    let assignedRoleId = null;
+    if (roleId) {
+      const inviteRole = await Role.findOne({ _id: roleId, organizationId });
+      if (!inviteRole) return res.status(404).json({ message: "Role not found in your organization" });
+      if (inviteRole.isSystem && inviteRole.name === "OWNER") {
+        return res.status(403).json({ message: "Cannot assign the OWNER role via invite" });
+      }
+      assignedRoleId = inviteRole._id;
+    }
+
     const invite = await Invite.create({
       organizationId,
-      email: email.toLowerCase(),
-      role,
+      email: normalizedEmail,
+      role: "MEMBER",
       token: hashedToken,
       expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
       status: "PENDING",
+      roleId: assignedRoleId,
     });
 
-    // Build invite link
     const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
     const inviteLink = `${frontendUrl}/accept-invite?token=${rawToken}`;
 
-    // Send email
     const emailResult = await sendInviteEmail({
-      to: email.toLowerCase(),
+      to: normalizedEmail,
       inviteLink,
       organizationName: org.name,
-      role,
+      role: "MEMBER",
     });
 
     return res.status(201).json({
@@ -97,12 +90,12 @@ router.post("/", authenticate, requireRole("OWNER"), async (req, res) => {
         id: invite._id,
         email: invite.email,
         role: invite.role,
+        roleId: invite.roleId,
         expiresAt: invite.expiresAt,
         status: invite.status,
       },
       emailSent: emailResult.success,
-      // Include link in dev mode OR when email fails (so owner can share manually)
-      ...( (process.env.NODE_ENV === "development" || !emailResult.success) && { inviteLink }),
+      ...((process.env.NODE_ENV === "development" || !emailResult.success) && { inviteLink }),
     });
   } catch (error) {
     console.error("Invite creation error:", error);
@@ -110,65 +103,36 @@ router.post("/", authenticate, requireRole("OWNER"), async (req, res) => {
   }
 });
 
-/* ─── POST /api/invites/accept — Accept invite (public) ─── */
-
 router.post("/accept", async (req, res) => {
   try {
     const { token, name, password } = req.body;
-
     if (!token || !name || !password) {
-      return res
-        .status(400)
-        .json({ message: "Token, name, and password are required" });
+      return res.status(400).json({ message: "Token, name, and password are required" });
     }
-
     if (password.length < 8) {
-      return res
-        .status(400)
-        .json({ message: "Password must be at least 8 characters" });
+      return res.status(400).json({ message: "Password must be at least 8 characters" });
     }
 
     const hashedToken = hashToken(token);
-
     const invite = await Invite.findOne({ token: hashedToken });
-    if (!invite) {
-      return res.status(404).json({ message: "Invalid invite link" });
-    }
-
+    if (!invite) return res.status(404).json({ message: "Invalid invite link" });
     if (invite.status === "ACCEPTED" || invite.acceptedAt) {
-      return res
-        .status(400)
-        .json({ message: "This invite has already been used" });
+      return res.status(400).json({ message: "This invite has already been used" });
     }
+    if (invite.status === "REVOKED") return res.status(400).json({ message: "This invite has been revoked" });
+    if (invite.expiresAt < new Date()) return res.status(400).json({ message: "This invite has expired" });
 
-    if (invite.status === "REVOKED") {
-      return res
-        .status(400)
-        .json({ message: "This invite has been revoked" });
-    }
+    const emailErr = await checkEmailAvailable(invite.email);
+    if (emailErr) return res.status(409).json({ message: emailErr });
 
-    if (invite.expiresAt < new Date()) {
-      return res.status(400).json({ message: "This invite has expired" });
-    }
-
-    // Check if user already exists with this email
-    const existingUser = await User.findOne({ email: invite.email });
-    if (existingUser) {
-      return res
-        .status(409)
-        .json({ message: "A user with this email already exists" });
-    }
-
-    const existingOrg = await Organization.findOne({ email: invite.email });
-    if (existingOrg) {
-      return res
-        .status(409)
-        .json({ message: "This email is already registered as an organization owner" });
-    }
-
-    // Create user
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const { privateKey, publicKey } = generateKeys();
+
+    let userRoleId = invite.roleId || null;
+    if (!userRoleId) {
+      const defaultRole = await getDefaultMemberRole(invite.organizationId);
+      if (defaultRole) userRoleId = defaultRole._id;
+    }
 
     const user = await User.create({
       organizationId: invite.organizationId,
@@ -176,42 +140,28 @@ router.post("/accept", async (req, res) => {
       email: invite.email,
       password: hashedPassword,
       role: invite.role,
+      roleId: userRoleId,
       privateKey,
       publicKey,
     });
 
-    // Mark invite as accepted
     invite.acceptedAt = new Date();
     invite.status = "ACCEPTED";
     await invite.save();
 
-    // Auto-login: issue JWT tokens
-    const payload = {
-      id: user._id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
-      organizationId: user.organizationId,
-      userType: "user",
-    };
-
+    const payload = buildUserPayload(user, "user");
     const tokens = issueTokens(user.privateKey, payload, false);
     user.refreshToken = tokens.refreshToken;
     user.refreshTokenExpires = tokens.refreshExpires;
     await user.save();
 
     setAuthCookies(res, tokens.accessToken, tokens.refreshToken, false);
+    const perms = await resolvePermissions(user, "user");
 
     return res.json({
       success: true,
       message: "Invite accepted successfully",
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        organizationId: user.organizationId,
-      },
+      user: buildUserResponse(user, "user", perms.permissions, perms.roleName),
     });
   } catch (error) {
     console.error("Accept invite error:", error);
@@ -219,9 +169,7 @@ router.post("/accept", async (req, res) => {
   }
 });
 
-/* ─── POST /api/invites/revoke — Revoke a pending invite (OWNER only) ─── */
-
-router.post("/revoke", authenticate, requireRole("OWNER"), async (req, res) => {
+router.post("/revoke", authenticate, requirePermission("USER_INVITE"), async (req, res) => {
   try {
     const { inviteId } = req.body;
 
@@ -257,9 +205,7 @@ router.post("/revoke", authenticate, requireRole("OWNER"), async (req, res) => {
   }
 });
 
-/* ─── POST /api/invites/delete — Delete an invite (OWNER only) ─── */
-
-router.post("/delete", authenticate, requireRole("OWNER"), async (req, res) => {
+router.post("/delete", authenticate, requirePermission("USER_INVITE"), async (req, res) => {
   try {
     const { inviteId } = req.body;
 
@@ -286,9 +232,7 @@ router.post("/delete", authenticate, requireRole("OWNER"), async (req, res) => {
   }
 });
 
-/* ─── POST /api/invites/resend — Resend invite email (OWNER only) ─── */
-
-router.post("/resend", authenticate, requireRole("OWNER"), async (req, res) => {
+router.post("/resend", authenticate, requirePermission("USER_INVITE"), async (req, res) => {
   try {
     const { inviteId } = req.body;
 
@@ -310,7 +254,7 @@ router.post("/resend", authenticate, requireRole("OWNER"), async (req, res) => {
       return res.status(400).json({ message: "Invite has expired — create a new one instead" });
     }
 
-    // Generate a fresh token (invalidates old link)
+    // Generate fresh token
     const rawToken = generateToken();
     invite.token = hashToken(rawToken);
     invite.expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
@@ -342,8 +286,6 @@ router.post("/resend", authenticate, requireRole("OWNER"), async (req, res) => {
   }
 });
 
-/* ─── POST /api/invites/users — List org users & pending invites ─── */
-
 router.post("/users", authenticate, async (req, res) => {
   try {
     const organizationId = req.user.organizationId;
@@ -356,16 +298,27 @@ router.post("/users", authenticate, async (req, res) => {
       return res.status(404).json({ message: "Organization not found" });
     }
 
-    // Get all users in org
+    // Get all users in org (include roleId for RBAC info)
     const users = await User.find({ organizationId }).select(
-      "name email role createdAt"
+      "name email role roleId createdAt"
     );
 
     // Get pending invites (PENDING only, not REVOKED/ACCEPTED)
     const invites = await Invite.find({
       organizationId,
       status: "PENDING",
-    }).select("email role expiresAt createdAt status");
+    }).select("email role roleId expiresAt createdAt status");
+
+    // Resolve role names for users and invites
+    const allRoleIds = [
+      ...users.filter((u) => u.roleId).map((u) => u.roleId),
+      ...invites.filter((i) => i.roleId).map((i) => i.roleId),
+    ];
+    let roleMap = {};
+    if (allRoleIds.length > 0) {
+      const roles = await Role.find({ _id: { $in: allRoleIds } }).select("name").lean();
+      roleMap = Object.fromEntries(roles.map((r) => [r._id.toString(), r.name]));
+    }
 
     // Combine owner + users
     const allUsers = [
@@ -374,6 +327,8 @@ router.post("/users", authenticate, async (req, res) => {
         name: org.ownerName,
         email: org.email,
         role: "OWNER",
+        roleId: null,
+        roleName: "OWNER",
         type: "owner",
         joinedAt: org.createdAt,
       },
@@ -382,6 +337,8 @@ router.post("/users", authenticate, async (req, res) => {
         name: u.name,
         email: u.email,
         role: u.role,
+        roleId: u.roleId || null,
+        roleName: u.roleId ? (roleMap[u.roleId.toString()] || "Unknown") : u.role,
         type: "user",
         joinedAt: u.createdAt,
       })),
@@ -391,6 +348,8 @@ router.post("/users", authenticate, async (req, res) => {
       id: i._id,
       email: i.email,
       role: i.role,
+      roleId: i.roleId || null,
+      roleName: i.roleId ? (roleMap[i.roleId.toString()] || "Unknown") : i.role,
       expiresAt: i.expiresAt,
       createdAt: i.createdAt,
       status: i.status,

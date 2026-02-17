@@ -1,14 +1,14 @@
 import mongoose from "mongoose";
 
-
 const organizationSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
     ownerName: { type: String, required: true, trim: true },
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
     password: { type: String, required: true },
     address: { type: String, trim: true },
     phone: { type: String, required: true, trim: true },
+    planId: { type: mongoose.Schema.Types.ObjectId, ref: "Plan", default: null },
     refreshToken: { type: String, default: null },
     refreshTokenExpires: { type: Date, default: null },
     rememberMe: { type: Boolean, default: false },

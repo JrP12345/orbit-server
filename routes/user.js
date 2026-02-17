@@ -3,17 +3,17 @@ import bcrypt from "bcryptjs";
 import { Organization } from "../models/organization.model.js";
 import { User } from "../models/user.model.js";
 import { Invite } from "../models/invite.model.js";
-import { authenticate, buildUserResponse } from "../middleware/auth.js";
-import { requireRole } from "../middleware/role.js";
-import { clearAuthCookies } from "../lib/auth.js";
+import { Role } from "../models/role.model.js";
+import { authenticate, buildUserResponse, resolvePermissions } from "../middleware/auth.js";
+import { requirePermission } from "../middleware/permission.js";
+import { BCRYPT_ROUNDS } from "../lib/validate.js";
+import { cacheDelPattern } from "../db/redis.js";
 
 const router = express.Router();
 
-/* ─── POST /api/users/update — OWNER updates a member ─── */
-
-router.post("/update", authenticate, requireRole("OWNER"), async (req, res) => {
+router.post("/update", authenticate, requirePermission("PAGE_SETTINGS"), requirePermission("USER_INVITE"), async (req, res) => {
   try {
-    const { userId, name, role } = req.body;
+    const { userId, name, role, roleId } = req.body;
     if (!userId) {
       return res.status(400).json({ message: "userId is required" });
     }
@@ -42,7 +42,27 @@ router.post("/update", authenticate, requireRole("OWNER"), async (req, res) => {
       user.role = role;
     }
 
+    // Update RBAC role
+    if (roleId !== undefined) {
+      if (roleId === null) {
+        user.roleId = null;
+      } else {
+        const roleDoc = await Role.findOne({
+          _id: roleId,
+          organizationId: req.user.organizationId,
+        });
+        if (!roleDoc) {
+          return res.status(404).json({ message: "Role not found in your organization" });
+        }
+        if (roleDoc.isSystem && roleDoc.name === "OWNER") {
+          return res.status(403).json({ message: "Cannot assign OWNER role to team members" });
+        }
+        user.roleId = roleDoc._id;
+      }
+    }
+
     await user.save();
+    if (req.body.roleId !== undefined) await cacheDelPattern(`perms:${user._id}`);
 
     return res.json({
       success: true,
@@ -52,6 +72,7 @@ router.post("/update", authenticate, requireRole("OWNER"), async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
+        roleId: user.roleId,
       },
     });
   } catch (error) {
@@ -60,9 +81,7 @@ router.post("/update", authenticate, requireRole("OWNER"), async (req, res) => {
   }
 });
 
-/* ─── POST /api/users/delete — OWNER removes a member ─── */
-
-router.post("/delete", authenticate, requireRole("OWNER"), async (req, res) => {
+router.post("/delete", authenticate, requirePermission("PAGE_SETTINGS"), requirePermission("USER_INVITE"), async (req, res) => {
   try {
     const { userId } = req.body;
     if (!userId) {
@@ -97,8 +116,6 @@ router.post("/delete", authenticate, requireRole("OWNER"), async (req, res) => {
     return res.status(500).json({ message: "Internal server error" });
   }
 });
-
-/* ─── POST /api/users/profile — Authenticated user updates own profile ─── */
 
 router.post("/profile", authenticate, async (req, res) => {
   try {
@@ -146,15 +163,16 @@ router.post("/profile", authenticate, async (req, res) => {
       if (!valid) {
         return res.status(401).json({ message: "Current password is incorrect" });
       }
-      entity.password = await bcrypt.hash(newPassword, 10);
+      entity.password = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
     }
 
     await entity.save();
 
+    const resolved = await resolvePermissions(entity, type);
     return res.json({
       success: true,
       message: "Profile updated successfully",
-      user: buildUserResponse(entity, type),
+      user: buildUserResponse(entity, type, resolved.permissions, resolved.roleName),
     });
   } catch (error) {
     console.error("Profile update error:", error);
