@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: orbit-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      # Add all other environment variables from .env in Render dashboard
