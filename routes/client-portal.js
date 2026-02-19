@@ -3,12 +3,11 @@ import bcrypt from "bcryptjs";
 import { Client } from "../models/client.model.js";
 import { Requirement, VALID_PRIORITIES, VALID_REQ_STATUSES } from "../models/requirement.model.js";
 import { Task } from "../models/task.model.js";
-import { Organization } from "../models/organization.model.js";
 import { hashToken } from "../lib/crypto.js";
 import { generateKeys, issueTokens, setAuthCookies } from "../lib/auth.js";
 import { authenticate, buildUserPayload, buildUserResponse, resolvePermissions } from "../middleware/auth.js";
 import { syncRequirementStatus } from "./task.js";
-import { uploadFile, deleteFile, getPresignedUrl } from "../lib/storage.js";
+import { uploadFile, getPresignedUrl } from "../lib/storage.js";
 import { createUpload } from "../lib/multerConfig.js";
 import { BCRYPT_ROUNDS } from "../lib/validate.js";
 
@@ -180,7 +179,7 @@ router.post("/requirements", authenticate, requireClient, async (req, res) => {
 router.post("/requirements/list", authenticate, requireClient, async (req, res) => {
   try {
     const { organizationId, clientId } = req.user;
-    const { status } = req.body;
+    const { status } = req.body || {};
 
     const filter = { organizationId, clientId };
     if (status && VALID_REQ_STATUSES.includes(status)) {
@@ -430,7 +429,7 @@ router.post("/requirements/attachment", authenticate, requireClient, async (req,
 router.post("/tasks/list", authenticate, requireClient, async (req, res) => {
   try {
     const { organizationId, clientId } = req.user;
-    const { statusFilter } = req.body; // optional: "ALL", "SENT_TO_CLIENT", "DONE", etc.
+    const { statusFilter } = req.body || {}; // optional: "ALL", "SENT_TO_CLIENT", "DONE", etc.
 
     const filter = { organizationId, clientId };
     if (statusFilter && statusFilter !== "ALL") {

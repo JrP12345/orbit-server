@@ -121,7 +121,12 @@ export async function authenticate(req, res, next) {
           return next();
         }
       }
-    } catch { /* access token invalid — try refresh */ }
+    } catch (err) {
+      // Access token invalid — try refresh below
+      if (err.name !== 'JsonWebTokenError' && err.name !== 'TokenExpiredError') {
+        console.error('Auth middleware access token error:', err);
+      }
+    }
   }
 
   if (!refreshToken) {
@@ -162,7 +167,10 @@ export async function authenticate(req, res, next) {
     const resolved = await resolvePermissions(entity, type);
     req.user.permissions = resolved.permissions;
     return next();
-  } catch {
+  } catch (err) {
+    if (err.name !== 'JsonWebTokenError' && err.name !== 'TokenExpiredError') {
+      console.error('Auth middleware refresh token error:', err);
+    }
     clearAuthCookies(res);
     return res.status(401).json({ message: "Authentication failed" });
   }

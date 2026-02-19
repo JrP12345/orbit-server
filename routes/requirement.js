@@ -370,7 +370,9 @@ router.post("/attachment/delete", authenticate, requirePermission("PAGE_CLIENTS"
         return res.status(404).json({ message: "Attachment not found" });
       }
 
-      await deleteFile(key);
+      await deleteFile(key).catch((err) => {
+        console.error("R2 deletion failed, removing metadata anyway:", err.message);
+      });
       requirement.attachments.splice(idx, 1);
       await requirement.save();
 

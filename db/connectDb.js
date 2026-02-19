@@ -27,5 +27,4 @@ export async function gracefulDisconnect() {
     console.error("Error closing MongoDB:", error);
   }
 }
-
 export default mongoose;

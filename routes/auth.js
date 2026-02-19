@@ -20,7 +20,7 @@ router.post("/register", async (req, res) => {
     return res.status(403).json({ message: "Registration is only allowed in development environment" });
   }
   try {
-    const { name, ownerName, email, password, address, phone } = req.body;
+    const { name, ownerName, email, password, address, phone, country, businessEmail, website } = req.body;
     if (!name?.trim() || !ownerName?.trim() || !email?.trim() || !password) {
       return res.status(400).json({ message: "Organization name, owner name, email, and password are required" });
     }
@@ -45,6 +45,9 @@ router.post("/register", async (req, res) => {
       password: hashedPassword,
       address: address?.trim() || "",
       phone: phone?.trim() || "",
+      country: country?.trim() || "",
+      businessEmail: businessEmail?.trim()?.toLowerCase() || "",
+      website: website?.trim() || "",
       privateKey,
       publicKey,
       ...(defaultPlan && { planId: defaultPlan._id }),

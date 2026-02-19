@@ -100,11 +100,10 @@ router.post("/delete", authenticate, requirePermission("PAGE_SETTINGS"), require
     // Delete the user
     await User.deleteOne({ _id: userId });
 
-    // Clean up: Delete any accepted invites for this user's email
+    // Clean up: Delete any lingering invites for this user's email
     await Invite.deleteMany({
       organizationId: req.user.organizationId,
       email: user.email,
-      status: "ACCEPTED",
     });
 
     return res.json({

@@ -145,9 +145,8 @@ router.post("/accept", async (req, res) => {
       publicKey,
     });
 
-    invite.acceptedAt = new Date();
-    invite.status = "ACCEPTED";
-    await invite.save();
+    // Delete the invite now that the user has been created
+    await Invite.deleteOne({ _id: invite._id });
 
     const payload = buildUserPayload(user, "user");
     const tokens = issueTokens(user.privateKey, payload, false);
@@ -309,15 +308,25 @@ router.post("/users", authenticate, async (req, res) => {
       status: "PENDING",
     }).select("email role roleId expiresAt createdAt status");
 
-    // Resolve role names for users and invites
+    // Resolve role names and permissions for users and invites
     const allRoleIds = [
       ...users.filter((u) => u.roleId).map((u) => u.roleId),
       ...invites.filter((i) => i.roleId).map((i) => i.roleId),
     ];
     let roleMap = {};
     if (allRoleIds.length > 0) {
-      const roles = await Role.find({ _id: { $in: allRoleIds } }).select("name").lean();
-      roleMap = Object.fromEntries(roles.map((r) => [r._id.toString(), r.name]));
+      const roles = await Role.find({ _id: { $in: allRoleIds } })
+        .populate("permissions", "key")
+        .lean();
+      roleMap = Object.fromEntries(
+        roles.map((r) => [
+          r._id.toString(),
+          {
+            name: r.name,
+            permissions: (r.permissions || []).map((p) => p.key),
+          },
+        ])
+      );
     }
 
     // Combine owner + users
@@ -330,18 +339,23 @@ router.post("/users", authenticate, async (req, res) => {
         roleId: null,
         roleName: "OWNER",
         type: "owner",
+        permissions: ["ALL"],
         joinedAt: org.createdAt,
       },
-      ...users.map((u) => ({
-        id: u._id,
-        name: u.name,
-        email: u.email,
-        role: u.role,
-        roleId: u.roleId || null,
-        roleName: u.roleId ? (roleMap[u.roleId.toString()] || "Unknown") : u.role,
-        type: "user",
-        joinedAt: u.createdAt,
-      })),
+      ...users.map((u) => {
+        const roleInfo = u.roleId ? roleMap[u.roleId.toString()] : null;
+        return {
+          id: u._id,
+          name: u.name,
+          email: u.email,
+          role: u.role,
+          roleId: u.roleId || null,
+          roleName: roleInfo?.name || u.role,
+          type: "user",
+          permissions: roleInfo?.permissions || [],
+          joinedAt: u.createdAt,
+        };
+      }),
     ];
 
     const pendingInvites = invites.map((i) => ({
@@ -349,7 +363,7 @@ router.post("/users", authenticate, async (req, res) => {
       email: i.email,
       role: i.role,
       roleId: i.roleId || null,
-      roleName: i.roleId ? (roleMap[i.roleId.toString()] || "Unknown") : i.role,
+      roleName: i.roleId ? (roleMap[i.roleId.toString()]?.name || "Unknown") : i.role,
       expiresAt: i.expiresAt,
       createdAt: i.createdAt,
       status: i.status,

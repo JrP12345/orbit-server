@@ -63,7 +63,11 @@ export async function cacheDel(...keys) {
 export async function cacheDelPattern(pattern) {
   try {
     if (!client || client.status !== "ready") return;
-    const keys = await client.keys(pattern);
-    if (keys.length > 0) await client.del(...keys);
+    let cursor = "0";
+    do {
+      const [nextCursor, keys] = await client.scan(cursor, "MATCH", pattern, "COUNT", 100);
+      cursor = nextCursor;
+      if (keys.length > 0) await client.del(...keys);
+    } while (cursor !== "0");
   } catch { /* silent */ }
 }

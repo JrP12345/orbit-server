@@ -49,7 +49,12 @@ R2_BUCKET_NAME=orbit-attachments
 ```
 orbit-server/
 ├── index.js                  Entry point, middleware, routes, lifecycle
-├── seedSuperAdmin.js         One-time super admin seed script
+├── app.js                    Express app factory (testable, no DB/server)
+├── vitest.config.js          Test runner configuration
+├── tests/
+│   ├── setup.js              Global setup (MongoMemoryServer, seeds)
+│   ├── helpers.js            Factory functions + auth helpers
+│   └── *.test.js             8 test files, 188 tests total
 ├── db/
 │   ├── connectDb.js          MongoDB connection (pooling, events)
 │   └── redis.js              Redis client + cache helpers (get/set/del/pattern)
@@ -276,6 +281,7 @@ All routes use POST with JSON body.
 
 Only ACTIVE + INVITED clients count against the limit.
 
+
 ## Redis Usage
 
 | Feature | Key Pattern | TTL |
@@ -289,9 +295,9 @@ Cache is invalidated on role update/delete, role assignment, and user role chang
 
 | Feature | Implementation |
 |---------|---------------|
-| HTTP headers | helmet (HSTS, X-Content-Type, etc.) |
+| HTTP headers | helmet (HSTS, X-Content-Type, CSP disabled) |
 | Rate limiting | Redis-backed (fallback: memory), auth 15/15min, API 200/15min |
-| NoSQL injection | Custom sanitizer strips `$`-prefixed keys |
+| NoSQL injection | Custom sanitizer strips `$`-prefixed keys from body, params, and query |
 | Password hashing | bcryptjs, 12 rounds |
 | Cookies | httpOnly, secure, SameSite strict |
 | Token storage | Invite/reset tokens SHA-256 hashed before DB write |
@@ -308,6 +314,125 @@ Cache is invalidated on role update/delete, role assignment, and user role chang
 6. Start Express on PORT
 
 Graceful shutdown: SIGINT/SIGTERM → close HTTP server → disconnect Redis → disconnect MongoDB.
+
+## Testing
+
+### Stack
+
+| Tool | Purpose |
+|------|---------|
+| [vitest](https://vitest.dev/) | Test runner — fast, ESM-native, globals mode |
+| [supertest](https://github.com/ladjs/supertest) | HTTP assertions against Express app |
+| [mongodb-memory-server](https://github.com/typegoose/mongodb-memory-server) | In-memory MongoDB for isolated, repeatable tests |
+| [@vitest/coverage-v8](https://vitest.dev/guide/coverage) | V8-based code coverage |
+
+### Why This Stack
+
+- **vitest** — native ESM support (no Babel needed), compatible with the project's `"type": "module"`, fast watch mode, built-in globals
+- **mongodb-memory-server** — each test run gets a fresh MongoDB instance, no external database needed, no data pollution between CI runs
+- **supertest** — full HTTP integration testing through the Express middleware stack (cookies, headers, auth, error handling)
+- **Redis not required** — all cache functions gracefully return `null` when Redis is unavailable, so tests run without a Redis server
+
+### Running Tests
+
+```bash
+# Run all tests once
+npm test
+
+# Run in watch mode (re-runs on file change)
+npm run test:watch
+
+# Run with V8 coverage report
+npm run test:coverage
+```
+
+### Test Architecture
+
+```
+orbit-server/
+├── app.js                    Express app factory (no DB/server lifecycle)
+├── vitest.config.js          Test runner config
+└── tests/
+    ├── setup.js              Global setup (MongoMemoryServer, seed data)
+    ├── helpers.js             Factory functions + auth helpers
+    ├── auth.test.js           24 tests — register, login, verify, logout, reset, sanitization
+    ├── invite.test.js         26 tests — create, accept, revoke, delete, resend
+    ├── user.test.js           18 tests — update, delete, profile
+    ├── client.test.js         22 tests — CRUD, archive, invite, plan limits
+    ├── task.test.js           33 tests — CRUD, lifecycle, state machine, files
+    ├── requirement.test.js    15 tests — list, filter, comment, status
+    ├── role.test.js           21 tests — CRUD, assign, defaults, permissions
+    └── client-portal.test.js  29 tests — accept, dashboard, requirements, tasks
+```
+
+**Total: 188 tests across 8 files covering all 9 route files**
+
+### How It Works
+
+1. **`app.js`** — Extracted `createApp()` factory that builds the Express app with all middleware and routes, without connecting to a database or starting a server. This decouples the app from infrastructure for testability.
+
+2. **`tests/setup.js`** — Global `beforeAll` starts MongoMemoryServer, connects Mongoose, and seeds Plans + Permissions (required for auth and RBAC). Global `afterAll` drops the database and stops the server.
+
+3. **`tests/helpers.js`** — Factory functions that create test entities with valid auth:
+   - `createTestOrg()` — organization + owner JWT cookies
+   - `createTestUser()` / `createTestUserWithRole()` — members with RBAC roles
+   - `createTestClient()` / `createTestClientWithAuth()` — clients with portal JWT
+   - `createTestTask()` / `createTestRequirement()` / `createTestInvite()`
+   - `agent()` — singleton supertest agent with cookie persistence
+   - `cleanDb()` — wipes all collections between tests (called in `beforeEach`)
+
+4. **Sequential execution** — Tests run sequentially (`sequence.concurrent: false`) since they share a single MongoMemoryServer instance per worker.
+
+### Test Coverage by Route
+
+| Route File | Test File | Tests | What's Covered |
+|------------|-----------|-------|----------------|
+| auth.js | auth.test.js | 24 | Register (validation, duplicate), login (all entity types, invalid), verify, logout, forgot/reset password, NoSQL injection sanitization (body + query), 404 |
+| invite.js | invite.test.js | 26 | Create (permission checks, duplicate, plan limits), accept (token validation, invite deletion), revoke, delete, resend, user list |
+| user.js | user.test.js | 18 | Update (role change, validation), delete (invite cleanup), profile (name, email, password change) |
+| client.js | client.test.js | 22 | Create (permission, plan limit, duplicate), list, update (rename, archive, reactivate), resend-invite, client requirements |
+| task.js | task.test.js | 33 | Create (requirement linking), list (visibility rules), detail, update, move (all 7 transitions, invalid transitions, history tracking, requirement auto-sync), delete (requirement unlink) |
+| requirement.js | requirement.test.js | 15 | List (pagination, client filter, status filter, search), detail, comment (add, validation), update-status (valid transitions) |
+| role.js + permission.js | role.test.js | 21 | Create (validation, duplicate), list (user counts), update (permissions), delete (user reassignment to MEMBER), assign, reset-defaults, permission list (grouping) |
+| client-portal.js | client-portal.test.js | 29 | Accept-invite (token validation, password set), dashboard (stats), requirements (create, list, filter, detail, comment), tasks (list, filter, approve/reject with requirement sync) |
+
+### Production Bugs Found During Testing
+
+Two bugs were discovered in [routes/client-portal.js](routes/client-portal.js) and fixed:
+
+1. **`POST /requirements/list`** — `const { status } = req.body` crashed with `TypeError` when no body was sent (Express 5 leaves `req.body` as `undefined` when Content-Type is missing). Fixed to `req.body || {}`.
+
+2. **`POST /tasks/list`** — Same issue with `const { statusFilter } = req.body`. Fixed to `req.body || {}`.
+
+Both were silent 500 errors in production that only surfaced under test conditions (supertest sends POST with no Content-Type when `.send()` is omitted).
+
+### Writing New Tests
+
+```js
+import { describe, it, expect, beforeEach } from "vitest";
+import { agent, createTestOrg, cleanDb } from "./helpers.js";
+
+describe("My Feature", () => {
+  let org, cookies;
+
+  beforeEach(async () => {
+    await cleanDb();
+    const result = await createTestOrg();
+    org = result.org;
+    cookies = result.cookies;
+  });
+
+  it("should do something", async () => {
+    const res = await agent()
+      .post("/api/my-route")
+      .set("Cookie", cookies)
+      .send({ key: "value" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("data");
+  });
+});
+```
 
 ## Design Decisions
 

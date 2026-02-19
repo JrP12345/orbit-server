@@ -73,6 +73,7 @@ function sanitize(obj) {
 app.use((req, _res, next) => {
   if (req.body) sanitize(req.body);
   if (req.params) sanitize(req.params);
+  if (req.query) sanitize(req.query);
   next();
 });
 
