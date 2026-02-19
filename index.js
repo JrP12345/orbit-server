@@ -144,7 +144,8 @@ let server;
 async function startServer() {
   try {
     await connectDB();
-    await connectRedis();
+    // Redis disabled for now - will use in-memory fallback
+    // await connectRedis();
     await seedPlans();
     await seedPermissions();
     await ensureSystemRolesForAllOrgs();
@@ -160,7 +161,7 @@ async function shutdown(signal) {
   if (server) {
     server.close(async () => {
       await gracefulDisconnect();
-      await disconnectRedis();
+      // await disconnectRedis();
       process.exit(0);
     });
     setTimeout(() => process.exit(1), 10_000);
